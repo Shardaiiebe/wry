@@ -16,13 +16,20 @@ use once_cell::sync::Lazy;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
-  core::{s, w, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
+  core::{s, w, IUnknown, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
   Win32::{
     Foundation::*,
     Globalization::*,
-    Graphics::Gdi::*,
+    Graphics::{DirectComposition::IDCompositionVisual, Gdi::*},
     System::{Com::*, LibraryLoader::GetModuleHandleW},
-    UI::{Input::KeyboardAndMouse::SetFocus, Shell::*, WindowsAndMessaging::*},
+    UI::{
+      Controls::WM_MOUSELEAVE,
+      Input::KeyboardAndMouse::{
+        ReleaseCapture, SetCapture, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+      },
+      Shell::*,
+      WindowsAndMessaging::*,
+    },
   },
 };
 
@@ -39,6 +46,11 @@ type EventRegistrationToken = i64;
 const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
+/// Subclass slot used by the Visual-hosting code path. Distinct from
+/// `PARENT_SUBCLASS_ID` so the two procs can coexist if a host installs
+/// both kinds of WebView on the same parent HWND.
+const PARENT_COMPOSITION_SUBCLASS_ID: u32 = WM_USER + 0x67;
+const PARENT_COMPOSITION_DESTROY_MESSAGE: u32 = WM_USER + 0x68;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
 impl From<webview2_com::Error> for Error {
@@ -53,6 +65,24 @@ impl From<windows::core::Error> for Error {
   }
 }
 
+/// Per-instance state for the Visual-hosting (DComp) code path. Held inside
+/// the parent-subclass `dwrefdata` slot (boxed) so the subclass proc can
+/// route WM_* messages to the composition controller without holding refs
+/// to `InnerWebView`.
+struct CompositionState {
+  controller: ICoreWebView2Controller,
+  composition: ICoreWebView2CompositionController,
+  /// Current bounds set via `SetBounds`, used for mouse hit-testing against
+  /// the parent client area. Updated by the wndproc on `WM_SIZE`.
+  bounds: RefCell<RECT>,
+  /// `true` between `TrackMouseEvent(TME_LEAVE)` and the synthesised
+  /// `WM_MOUSELEAVE`. Tracks whether we've armed leave-tracking yet.
+  tracking_mouse: RefCell<bool>,
+  /// `true` while we hold the mouse capture (between BUTTON_DOWN and
+  /// BUTTON_UP). When set, mouse forwarding bypasses hit-testing.
+  has_capture: RefCell<bool>,
+}
+
 pub(crate) struct InnerWebView {
   id: String,
   parent: RefCell<HWND>,
@@ -61,6 +91,11 @@ pub(crate) struct InnerWebView {
   pub controller: ICoreWebView2Controller,
   pub webview: ICoreWebView2,
   pub env: ICoreWebView2Environment,
+  /// Set when the WebView was created via the Visual-hosting code path.
+  /// Kept alive for the WebView's lifetime; the composition controller
+  /// aliases `controller` (same underlying COM object via `cast`).
+  #[allow(dead_code)]
+  composition: Option<ICoreWebView2CompositionController>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
   #[allow(dead_code)]
@@ -69,6 +104,13 @@ pub(crate) struct InnerWebView {
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
+    // For the Composition path, disconnect from the embedder's visual tree
+    // before tearing down the controller. The embedder owns the
+    // `IDCompositionDevice` and is responsible for `Commit()`ing after this
+    // drop to finalize the disconnect (see `with_dcomp_visual_target`).
+    if let Some(composition) = &self.composition {
+      let _ = unsafe { composition.SetRootVisualTarget(None) };
+    }
     let _ = unsafe { self.controller.Close() };
     if self.is_child {
       let _ = unsafe { DestroyWindow(self.hwnd) };
@@ -135,7 +177,27 @@ impl InnerWebView {
     } else {
       Self::create_environment(&attributes, pl_attrs.clone())?
     };
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
+
+    // Branch on the new `dcomp_visual_target` attribute:
+    // - `Some(visual)` -> Visual-hosting code path (composition controller).
+    // - `None`         -> Existing Windowed-hosting code path (child HWND
+    //   inside parent). This is the default and unchanged behavior.
+    let dcomp_visual = pl_attrs.dcomp_visual_target.clone();
+    let (controller, composition) = if let Some(visual) = &dcomp_visual {
+      let (controller, composition) = Self::create_composition_controller(
+        hwnd,
+        &env,
+        attributes.incognito,
+        background_color,
+        visual,
+      )?;
+      (controller, Some(composition))
+    } else {
+      let controller =
+        Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
+      (controller, None)
+    };
+
     let webview = Self::init_webview(
       parent,
       hwnd,
@@ -145,6 +207,7 @@ impl InnerWebView {
       &controller,
       pl_attrs,
       is_child,
+      composition.as_ref(),
     )?;
 
     let drag_drop_controller = drop_handler.map(|handler| {
@@ -165,6 +228,7 @@ impl InnerWebView {
       is_child,
       webview,
       env,
+      composition,
       drag_drop_controller,
     };
 
@@ -414,6 +478,79 @@ impl InnerWebView {
     webview2_com::wait_with_pump(rx)?
   }
 
+  /// Visual-hosting variant of [`Self::create_controller`]. Creates an
+  /// `ICoreWebView2CompositionController` (instead of an
+  /// `ICoreWebView2Controller`) and attaches its rendered output to the
+  /// supplied `IDCompositionVisual` via `SetRootVisualTarget`. Returns both
+  /// the composition controller and its `ICoreWebView2Controller` aspect
+  /// (the same underlying COM object via `cast`).
+  ///
+  /// Prefers `CreateCoreWebView2CompositionControllerWithOptions` (on
+  /// `ICoreWebView2Environment10`) so we can honor `incognito` and the
+  /// background-color override consistently with the Windowed code path;
+  /// falls back to `CreateCoreWebView2CompositionController` (on
+  /// `ICoreWebView2Environment3`) when the `Environment10` cast fails.
+  #[inline]
+  fn create_composition_controller(
+    hwnd: HWND,
+    env: &ICoreWebView2Environment,
+    incognito: bool,
+    background_color: Option<(u8, u8, u8, u8)>,
+    visual: &IDCompositionVisual,
+  ) -> Result<(ICoreWebView2Controller, ICoreWebView2CompositionController)> {
+    let (tx, rx) = mpsc::channel();
+
+    let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
+      move |error_code, controller| {
+        let result: crate::Result<ICoreWebView2CompositionController> = (|| {
+          error_code?;
+          controller.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
+        })();
+        tx.send(result)
+          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+      },
+    ));
+
+    unsafe {
+      if let Ok(env10) = env.cast::<ICoreWebView2Environment10>() {
+        let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
+
+        if let Some((r, g, b, mut a)) = background_color {
+          if let Ok(opts3) = controller_opts.cast::<ICoreWebView2ControllerOptions3>() {
+            if a != 0 {
+              a = 255;
+            }
+            opts3.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
+              R: r,
+              G: g,
+              B: b,
+              A: a,
+            })?;
+          }
+        }
+
+        controller_opts.SetIsInPrivateModeEnabled(incognito)?;
+        env10.CreateCoreWebView2CompositionControllerWithOptions(hwnd, &controller_opts, &handler)?;
+      } else {
+        let env3 = env.cast::<ICoreWebView2Environment3>()?;
+        env3.CreateCoreWebView2CompositionController(hwnd, &handler)?;
+      }
+    }
+
+    // Two layers to unwrap: the outer `webview2_com::Result` from
+    // `wait_with_pump` (channel-receive failure), then the inner
+    // `crate::Result` we sent from the completion handler.
+    let composition: ICoreWebView2CompositionController = webview2_com::wait_with_pump(rx)??;
+
+    unsafe {
+      let visual_iu: IUnknown = visual.cast()?;
+      composition.SetRootVisualTarget(&visual_iu)?;
+    }
+
+    let controller: ICoreWebView2Controller = composition.cast()?;
+    Ok((controller, composition))
+  }
+
   #[allow(clippy::too_many_arguments)]
   #[inline]
   fn init_webview(
@@ -425,6 +562,7 @@ impl InnerWebView {
     controller: &ICoreWebView2Controller,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
     is_child: bool,
+    composition: Option<&ICoreWebView2CompositionController>,
   ) -> Result<ICoreWebView2> {
     let webview = unsafe { controller.CoreWebView2()? };
 
@@ -535,9 +673,14 @@ impl InnerWebView {
       unsafe { webview.NavigateToString(&html)? };
     }
 
-    // Subclass parent for resizing and focus
+    // Subclass parent for resizing, focus, and (in the Composition path)
+    // mouse-input forwarding.
     if !is_child {
-      unsafe { Self::attach_parent_subclass(parent, controller) };
+      if let Some(composition) = composition {
+        unsafe { Self::attach_parent_subclass_composition(parent, controller, composition) };
+      } else {
+        unsafe { Self::attach_parent_subclass(parent, controller) };
+      }
     }
 
     unsafe {
@@ -1299,6 +1442,335 @@ impl InnerWebView {
       parent,
       Some(Self::parent_subclass_proc),
       PARENT_SUBCLASS_ID as _,
+    );
+    // The Composition-path subclass is installed in `attach_parent_subclass_composition`
+    // when the Visual-hosting code path is active. Tear it down the same way the
+    // Windowed-path teardown does: send the destroy message to free the boxed state,
+    // then remove the subclass. The destroy handler is idempotent: it no-ops when
+    // `dwrefdata` has already been nulled out.
+    SendMessageW(parent, PARENT_COMPOSITION_DESTROY_MESSAGE, None, None);
+    let _ = RemoveWindowSubclass(
+      parent,
+      Some(Self::parent_subclass_composition_proc),
+      PARENT_COMPOSITION_SUBCLASS_ID as _,
+    );
+  }
+
+  /// Subclass proc installed on the parent HWND when the WebView2 backend
+  /// took the Visual-hosting code path. Owns a boxed `CompositionState` via
+  /// `dwrefdata`; routes WM_* to the composition controller's
+  /// `SendMouseInput` / focus / sizing methods. Unhandled messages fall
+  /// through to `DefSubclassProc`.
+  ///
+  /// Keyboard input (`WM_KEY*`, `WM_CHAR`, `WM_IME_*`) is NOT intercepted:
+  /// `ICoreWebView2CompositionController` has no `SendKeyboardInput`
+  /// method — WebView2 picks up key events via the standard focus chain
+  /// after `MoveFocus` on `WM_SETFOCUS`. Pointer input (`WM_POINTER*`) is
+  /// also passed through; see the TODO comment in the match arm.
+  unsafe extern "system" fn parent_subclass_composition_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _uidsubclass: usize,
+    dwrefdata: usize,
+  ) -> LRESULT {
+    // Destroy / teardown path — runs before we attempt to deref the state.
+    if msg == WM_DESTROY || msg == PARENT_COMPOSITION_DESTROY_MESSAGE {
+      if !(dwrefdata as *mut ()).is_null() {
+        drop(Box::from_raw(dwrefdata as *mut CompositionState));
+        let _ = SetWindowSubclass(
+          hwnd,
+          Some(Self::parent_subclass_composition_proc),
+          PARENT_COMPOSITION_SUBCLASS_ID as _,
+          std::ptr::null::<()>() as _,
+        );
+      }
+      return DefSubclassProc(hwnd, msg, wparam, lparam);
+    }
+
+    if (dwrefdata as *mut ()).is_null() {
+      return DefSubclassProc(hwnd, msg, wparam, lparam);
+    }
+    let state = &*(dwrefdata as *const CompositionState);
+
+    match msg {
+      WM_SIZE => {
+        if wparam.0 != SIZE_MINIMIZED as usize {
+          let Ok(PhysicalSize { width, height }) = Self::parent_bounds(hwnd) else {
+            return DefSubclassProc(hwnd, msg, wparam, lparam);
+          };
+
+          let rect = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+          };
+          let _ = state.controller.SetBounds(rect);
+          *state.bounds.borrow_mut() = rect;
+
+          // We deliberately do NOT call `SetWindowPos` on the container HWND
+          // here: in Visual hosting the container has no visible area and
+          // its geometry is irrelevant. The embedder positions the WebView
+          // via the IDCompositionVisual passed to `with_dcomp_visual_target`.
+        }
+      }
+
+      WM_DPICHANGED | WM_DPICHANGED_BEFOREPARENT | WM_DPICHANGED_AFTERPARENT => {
+        // HIWORD of wParam carries the new DPI (only meaningful for
+        // WM_DPICHANGED). For the *_BEFOREPARENT / *_AFTERPARENT variants
+        // (DPI-aware V2 child contexts) we re-query DPI from the HWND.
+        let new_dpi = if msg == WM_DPICHANGED {
+          ((wparam.0 >> 16) & 0xFFFF) as f64
+        } else {
+          util::hwnd_dpi(hwnd) as f64
+        };
+        let scale = new_dpi / 96.0;
+        if let Ok(ctrl3) = state.controller.cast::<ICoreWebView2Controller3>() {
+          let _ = ctrl3.SetRasterizationScale(scale);
+        }
+      }
+
+      WM_SETFOCUS | WM_ENTERSIZEMOVE => {
+        // No child HWND to forward focus to in Visual hosting; programmatic
+        // MoveFocus is the documented entry into the WebView2 focus chain.
+        let _ = state
+          .controller
+          .MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+      }
+
+      WM_MOVE | WM_MOVING | WM_WINDOWPOSCHANGED => {
+        let _ = state.controller.NotifyParentWindowPositionChanged();
+      }
+
+      WM_MOUSEMOVE
+      | WM_LBUTTONDOWN
+      | WM_LBUTTONUP
+      | WM_LBUTTONDBLCLK
+      | WM_RBUTTONDOWN
+      | WM_RBUTTONUP
+      | WM_RBUTTONDBLCLK
+      | WM_MBUTTONDOWN
+      | WM_MBUTTONUP
+      | WM_MBUTTONDBLCLK
+      | WM_XBUTTONDOWN
+      | WM_XBUTTONUP
+      | WM_XBUTTONDBLCLK
+      | WM_MOUSEWHEEL
+      | WM_MOUSEHWHEEL
+      | WM_MOUSELEAVE
+      | WM_NCRBUTTONDOWN
+      | WM_NCRBUTTONUP => {
+        if Self::forward_mouse(hwnd, state, msg, wparam, lparam) {
+          // Mouse events that we successfully forwarded are not re-dispatched
+          // (they should not reach the default proc).
+          return LRESULT(0);
+        }
+      }
+
+      // WM_POINTER* — touch / pen input. ICoreWebView2CompositionController
+      // exposes SendPointerInput but populating ICoreWebView2PointerInfo
+      // requires translating GET_POINTERID_WPARAM → GetPointerType →
+      // GetPointerInfo into the WebView2 pointer-info object. Deferred for
+      // a later feature; until then these messages fall through to
+      // DefSubclassProc so the OS retains its default touch handling.
+      // TODO(feature-47-or-later): GET_POINTERID_WPARAM → GetPointerType →
+      // GetPointerInfo → populate ICoreWebView2PointerInfo → SendPointerInput.
+      _ => {}
+    }
+
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+  }
+
+  /// Mouse-message forwarder for the Composition path. Translates one WM_*
+  /// into a single `SendMouseInput` call on the composition controller,
+  /// after hit-testing against the WebView's current bounds (or honoring an
+  /// active capture). Manages `TrackMouseEvent` / `SetCapture` / `ReleaseCapture`
+  /// bookkeeping. Returns `true` if the message was consumed (forwarded or
+  /// intentionally swallowed); `false` to fall through to `DefSubclassProc`.
+  unsafe fn forward_mouse(
+    hwnd: HWND,
+    state: &CompositionState,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+  ) -> bool {
+    // Extract the client-area point. For most mouse messages LPARAM is
+    // already in client coords; for the screen-coord exceptions
+    // (WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_NCRBUTTON*) we translate via
+    // ScreenToClient. WM_MOUSELEAVE has no point (must be {0,0}).
+    let mut point = if msg == WM_MOUSELEAVE {
+      POINT { x: 0, y: 0 }
+    } else {
+      let mut p = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+      };
+      if matches!(
+        msg,
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL | WM_NCRBUTTONDOWN | WM_NCRBUTTONUP
+      ) {
+        let _ = ScreenToClient(hwnd, &mut p);
+      }
+      p
+    };
+
+    // Hit-test against current bounds. Capture overrides the test so we
+    // keep getting drag updates that leave the WebView's rect. WM_MOUSELEAVE
+    // is always forwarded (it's the synthesised exit notification).
+    let bounds = *state.bounds.borrow();
+    let inside = point.x >= bounds.left
+      && point.x < bounds.right
+      && point.y >= bounds.top
+      && point.y < bounds.bottom;
+    let capture = *state.has_capture.borrow();
+    let always_forward = msg == WM_MOUSELEAVE;
+    if !always_forward && !inside && !capture {
+      return false;
+    }
+
+    let (kind, mouse_data) = match msg {
+      WM_MOUSEMOVE => (COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE, 0u32),
+      WM_LBUTTONDOWN => (COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN, 0),
+      WM_LBUTTONUP => (COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP, 0),
+      WM_LBUTTONDBLCLK => (COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK, 0),
+      WM_RBUTTONDOWN => (COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN, 0),
+      WM_RBUTTONUP => (COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP, 0),
+      WM_RBUTTONDBLCLK => (
+        COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOUBLE_CLICK,
+        0,
+      ),
+      WM_MBUTTONDOWN => (COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN, 0),
+      WM_MBUTTONUP => (COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP, 0),
+      WM_MBUTTONDBLCLK => (
+        COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK,
+        0,
+      ),
+      WM_XBUTTONDOWN => {
+        // HIWORD(wParam) = XBUTTON1 (1) or XBUTTON2 (2).
+        let xb = ((wparam.0 >> 16) & 0xFFFF) as u32;
+        (COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN, xb)
+      }
+      WM_XBUTTONUP => {
+        let xb = ((wparam.0 >> 16) & 0xFFFF) as u32;
+        (COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP, xb)
+      }
+      WM_XBUTTONDBLCLK => {
+        let xb = ((wparam.0 >> 16) & 0xFFFF) as u32;
+        (COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOUBLE_CLICK, xb)
+      }
+      WM_MOUSEWHEEL => {
+        let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+        (COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL, delta as i32 as u32)
+      }
+      WM_MOUSEHWHEEL => {
+        let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+        (
+          COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
+          delta as i32 as u32,
+        )
+      }
+      WM_MOUSELEAVE => (COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE, 0),
+      // NC variants: same kind as their client-area counterparts, mouseData = 0.
+      WM_NCRBUTTONDOWN => (COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN, 0),
+      WM_NCRBUTTONUP => (COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP, 0),
+      _ => return false,
+    };
+
+    // virtualKeys: per MSDN, must be 0 for WM_MOUSELEAVE. For wheel messages
+    // the modifier flags live in LOWORD(wParam). For everything else
+    // LOWORD(wParam) carries MK_* flags directly.
+    let vkeys = if msg == WM_MOUSELEAVE {
+      COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS(0)
+    } else {
+      COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS((wparam.0 & 0xFFFF) as i32)
+    };
+
+    // WM_MOUSELEAVE clears the tracking state and is required to deliver a
+    // {0,0} point per MSDN; also clear after delivery.
+    if msg == WM_MOUSELEAVE {
+      *state.tracking_mouse.borrow_mut() = false;
+      point = POINT { x: 0, y: 0 };
+    } else if msg == WM_MOUSEMOVE {
+      // Arm leave-tracking the first time the cursor enters our rect, so we
+      // receive a WM_MOUSELEAVE when it exits.
+      let mut tracking = state.tracking_mouse.borrow_mut();
+      if !*tracking {
+        let mut tme = TRACKMOUSEEVENT {
+          cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+          dwFlags: TME_LEAVE,
+          hwndTrack: hwnd,
+          dwHoverTime: 0,
+        };
+        if TrackMouseEvent(&mut tme).is_ok() {
+          *tracking = true;
+        }
+      }
+    }
+
+    // Capture management: any *_BUTTON_DOWN starts capture; any *_BUTTON_UP
+    // releases it. The "DOWN_DBLCLK" messages count as DOWN for capture.
+    let down = matches!(
+      msg,
+      WM_LBUTTONDOWN
+        | WM_LBUTTONDBLCLK
+        | WM_RBUTTONDOWN
+        | WM_RBUTTONDBLCLK
+        | WM_MBUTTONDOWN
+        | WM_MBUTTONDBLCLK
+        | WM_XBUTTONDOWN
+        | WM_XBUTTONDBLCLK
+        | WM_NCRBUTTONDOWN
+    );
+    let up = matches!(
+      msg,
+      WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP | WM_NCRBUTTONUP
+    );
+    if down && !capture {
+      let _ = SetCapture(hwnd);
+      *state.has_capture.borrow_mut() = true;
+    } else if up && capture {
+      let _ = ReleaseCapture();
+      *state.has_capture.borrow_mut() = false;
+    }
+
+    let _ = state
+      .composition
+      .SendMouseInput(kind, vkeys, mouse_data, point);
+    true
+  }
+
+  #[inline]
+  unsafe fn attach_parent_subclass_composition(
+    parent: HWND,
+    controller: &ICoreWebView2Controller,
+    composition: &ICoreWebView2CompositionController,
+  ) {
+    // Seed bounds from the parent's current client rect so mouse hit-testing
+    // is correct before the first WM_SIZE arrives. (WM_SIZE updates this
+    // for every later resize; this initial-fill is purely for the time
+    // window between `build()` returning and the next size message.)
+    let initial_bounds = Self::parent_bounds(parent)
+      .map(|sz| RECT {
+        left: 0,
+        top: 0,
+        right: sz.width,
+        bottom: sz.height,
+      })
+      .unwrap_or_default();
+    let state = Box::new(CompositionState {
+      controller: controller.clone(),
+      composition: composition.clone(),
+      bounds: RefCell::new(initial_bounds),
+      tracking_mouse: RefCell::new(false),
+      has_capture: RefCell::new(false),
+    });
+    let _ = SetWindowSubclass(
+      parent,
+      Some(Self::parent_subclass_composition_proc),
+      PARENT_COMPOSITION_SUBCLASS_ID as _,
+      Box::into_raw(state) as _,
     );
   }
 

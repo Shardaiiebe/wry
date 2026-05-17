@@ -402,6 +402,8 @@ use self::webview2::*;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
   ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Environment,
 };
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::DirectComposition::IDCompositionVisual;
 
 use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc};
 
@@ -1677,6 +1679,12 @@ pub(crate) struct PlatformSpecificWebViewAttributes {
   extension_path: Option<PathBuf>,
   default_context_menus: bool,
   environment: Option<ICoreWebView2Environment>,
+  /// When `Some`, the WebView2 backend takes the Visual-hosting code path:
+  /// it creates a `CoreWebView2CompositionController` and attaches its
+  /// rendered output to this `IDCompositionVisual`, rather than installing
+  /// a child HWND inside the parent (the default Windowed-hosting code
+  /// path). See [`WebViewBuilderExtWindows::with_dcomp_visual_target`].
+  pub(crate) dcomp_visual_target: Option<IDCompositionVisual>,
 }
 
 #[cfg(windows)]
@@ -1692,6 +1700,7 @@ impl Default for PlatformSpecificWebViewAttributes {
       browser_extensions_enabled: false,
       extension_path: None,
       environment: None,
+      dcomp_visual_target: None,
     }
   }
 }
@@ -1776,6 +1785,36 @@ pub trait WebViewBuilderExtWindows {
   /// Set the environment for the webview.
   /// Useful if you need to share the same environment, for instance when using the [`WebViewBuilder::with_new_window_req_handler`].
   fn with_environment(self, environment: ICoreWebView2Environment) -> Self;
+
+  /// Render this WebView through the **Visual-hosting** code path, attached
+  /// to the supplied `IDCompositionVisual`, rather than as a child HWND
+  /// (Windowed hosting, the default).
+  ///
+  /// When set, wry calls `CreateCoreWebView2CompositionController` and
+  /// `SetRootVisualTarget(visual)` instead of `CreateCoreWebView2Controller`.
+  /// The WebView2 output composites into the visual's subtree; the embedder
+  /// is responsible for placing the visual in its own DComp visual tree and
+  /// for calling `IDCompositionDevice::Commit` after build (and after the
+  /// WebView drops, to finalize disconnection).
+  ///
+  /// Mouse input is forwarded from the parent HWND to the composition
+  /// controller via `SendMouseInput`, with hit-testing against the WebView's
+  /// current bounds (set via `SetBounds`). Keyboard input flows through the
+  /// standard focus chain — WebView2 picks up `WM_KEY*` / `WM_CHAR` once
+  /// focus is moved to it on `WM_SETFOCUS`. IME (`WM_IME_*`) and pointer
+  /// (`WM_POINTER*`) messages are currently passed through to
+  /// `DefWindowProcW` unchanged.
+  ///
+  /// ## Notes
+  ///
+  /// - The embedder owns the `IDCompositionDevice` and visual tree; wry only
+  ///   holds the supplied `IDCompositionVisual` reference for the lifetime
+  ///   of the WebView. On drop wry calls `SetRootVisualTarget(None)` to
+  ///   disconnect, but the embedder must `Commit()` the DComp device to
+  ///   finalize the disconnection.
+  /// - This is only honored on Windows. On other platforms the method is
+  ///   not present.
+  fn with_dcomp_visual_target(self, visual: IDCompositionVisual) -> Self;
 }
 
 #[cfg(windows)]
@@ -1822,6 +1861,11 @@ impl WebViewBuilderExtWindows for WebViewBuilder<'_> {
 
   fn with_environment(mut self, environment: ICoreWebView2Environment) -> Self {
     self.platform_specific.environment.replace(environment);
+    self
+  }
+
+  fn with_dcomp_visual_target(mut self, visual: IDCompositionVisual) -> Self {
+    self.platform_specific.dcomp_visual_target = Some(visual);
     self
   }
 }
