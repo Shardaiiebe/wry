@@ -51,6 +51,12 @@ const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 /// both kinds of WebView on the same parent HWND.
 const PARENT_COMPOSITION_SUBCLASS_ID: u32 = WM_USER + 0x67;
 const PARENT_COMPOSITION_DESTROY_MESSAGE: u32 = WM_USER + 0x68;
+/// Sent by `set_bounds_inner` to push an updated bounds RECT into the
+/// composition-path subclass state. lparam carries a `*mut RECT` (heap-
+/// allocated, transferred ownership; the subclass proc frees it via
+/// `Box::from_raw`).  This keeps the hit-testing rect in sync when the
+/// embedder resizes the WebView without a `WM_SIZE` on the parent.
+const PARENT_COMPOSITION_BOUNDS_CHANGED_MESSAGE: u32 = WM_USER + 0x69;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
 impl From<webview2_com::Error> for Error {
@@ -1563,10 +1569,27 @@ impl InnerWebView {
       | WM_NCRBUTTONDOWN
       | WM_NCRBUTTONUP => {
         if Self::forward_mouse(hwnd, state, msg, wparam, lparam) {
-          // Mouse events that we successfully forwarded are not re-dispatched
-          // (they should not reach the default proc).
-          return LRESULT(0);
+          // WM_MOUSELEAVE is forwarded but intentionally NOT consumed: the
+          // host may have its own `TrackMouseEvent` armed (e.g. for tooltip
+          // or hover-highlight logic) and swallowing the leave would break
+          // it. All other forwarded mouse messages are consumed here so they
+          // don't reach the default proc a second time.
+          if msg != WM_MOUSELEAVE {
+            return LRESULT(0);
+          }
+          // fall through to DefSubclassProc below
         }
+      }
+
+      PARENT_COMPOSITION_BOUNDS_CHANGED_MESSAGE => {
+        // Sent by `set_bounds_inner` when the embedder resizes the WebView
+        // without triggering a `WM_SIZE` on the parent. `lparam` carries a
+        // heap-allocated `RECT` whose ownership is transferred here.
+        if lparam.0 != 0 {
+          let new_rect = *Box::from_raw(lparam.0 as *mut RECT);
+          *state.bounds.borrow_mut() = new_rect;
+        }
+        return LRESULT(0);
       }
 
       // WM_POINTER* — touch / pen input. ICoreWebView2CompositionController
@@ -1911,12 +1934,29 @@ impl InnerWebView {
     position: PhysicalPosition<i32>,
   ) -> Result<()> {
     unsafe {
-      self.controller.SetBounds(RECT {
+      let new_rect = RECT {
         top: 0,
         left: 0,
         right: size.width,
         bottom: size.height,
-      })?;
+      };
+      self.controller.SetBounds(new_rect)?;
+
+      // Keep the composition-path subclass hit-testing rect in sync.
+      // `WM_SIZE` on the parent handles resizes triggered by the host window,
+      // but an embedder-driven `set_bounds` call can change the controller
+      // bounds without a matching `WM_SIZE`. Send the new rect as a heap
+      // pointer so the subclass can update `state.bounds`.
+      if self.composition.is_some() {
+        let parent = *self.parent.borrow();
+        let rect_ptr = Box::into_raw(Box::new(new_rect));
+        SendMessageW(
+          parent,
+          PARENT_COMPOSITION_BOUNDS_CHANGED_MESSAGE,
+          Some(WPARAM(0)),
+          Some(LPARAM(rect_ptr as isize)),
+        );
+      }
 
       SetWindowPos(
         self.hwnd,
@@ -2168,7 +2208,16 @@ impl InnerWebView {
 
       if !self.is_child {
         Self::dettach_parent_subclass(*self.parent.borrow());
-        Self::attach_parent_subclass(parent, &self.controller);
+
+        // Re-install the correct subclass variant on the new parent.
+        // For the Composition path we need `attach_parent_subclass_composition`
+        // (which seeds bounds, arms the composition proc, etc.); the Windowed
+        // path continues to use `attach_parent_subclass`.
+        if let Some(composition) = &self.composition {
+          Self::attach_parent_subclass_composition(parent, &self.controller, composition);
+        } else {
+          Self::attach_parent_subclass(parent, &self.controller);
+        }
 
         *self.parent.borrow_mut() = parent;
 
