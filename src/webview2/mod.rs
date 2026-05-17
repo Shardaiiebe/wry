@@ -1956,13 +1956,14 @@ impl InnerWebView {
       };
       self.controller.SetBounds(new_rect)?;
 
-      // Keep the composition-path subclass hit-testing rect in sync.
-      // `WM_SIZE` on the parent handles resizes triggered by the host window,
-      // but an embedder-driven `set_bounds` call can change the controller
-      // bounds without a matching `WM_SIZE`. The RECT always has left=0,top=0
-      // in this code path so we pack width into wparam and height into lparam
-      // to avoid a heap allocation and any leak risk on the early-return path.
       if self.composition.is_some() {
+        // Keep the composition-path subclass hit-testing rect in sync.
+        // `WM_SIZE` on the parent handles resizes triggered by the host
+        // window, but an embedder-driven `set_bounds` call can change the
+        // controller bounds without a matching `WM_SIZE`. The RECT always
+        // has left=0,top=0 in this code path so we pack width into wparam
+        // and height into lparam to avoid a heap allocation and any leak
+        // risk on the early-return path.
         let parent = *self.parent.borrow();
         SendMessageW(
           parent,
@@ -1970,17 +1971,29 @@ impl InnerWebView {
           Some(WPARAM(new_rect.right as usize)),
           Some(LPARAM(new_rect.bottom as isize)),
         );
-      }
 
-      SetWindowPos(
-        self.hwnd,
-        None,
-        position.x,
-        position.y,
-        size.width,
-        size.height,
-        SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
-      )?;
+        // In Visual hosting the container HWND is purely a WebView2-side
+        // host reference; rendering goes to the IDCompositionVisual passed
+        // via `with_dcomp_visual_target`. We deliberately do NOT SetWindowPos
+        // it to cover the parent's client area — that would steal mouse
+        // messages from the parent's subclass (where input forwarding to
+        // `SendMouseInput` lives) and force the parent's WM_SETCURSOR through
+        // the container's null hCursor. The container stays at its initial
+        // 0×0 size; only `controller.SetBounds` above drives the WebView2
+        // paint rect.
+      } else {
+        // Windowed hosting: the container IS the visible WebView area, so
+        // its size + position must follow the embedder's bounds.
+        SetWindowPos(
+          self.hwnd,
+          None,
+          position.x,
+          position.y,
+          size.width,
+          size.height,
+          SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+        )?;
+      }
     }
 
     Ok(())
