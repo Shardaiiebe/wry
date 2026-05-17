@@ -1792,10 +1792,10 @@ pub trait WebViewBuilderExtWindows {
   ///
   /// When set, wry calls `CreateCoreWebView2CompositionController` and
   /// `SetRootVisualTarget(visual)` instead of `CreateCoreWebView2Controller`.
-  /// The WebView2 output composites into the visual's subtree; the embedder
-  /// is responsible for placing the visual in its own DComp visual tree and
-  /// for calling `IDCompositionDevice::Commit` after build (and after the
-  /// WebView drops, to finalize disconnection).
+  /// The WebView2 output is rendered as the content of `visual`; the embedder
+  /// positions the WebView by transforming `visual` in its own DComp visual
+  /// tree and is responsible for calling `IDCompositionDevice::Commit` after
+  /// build (and after the WebView drops, to finalize disconnection).
   ///
   /// Mouse input is forwarded from the parent HWND to the composition
   /// controller via `SendMouseInput`, with hit-testing against the WebView's

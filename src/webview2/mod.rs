@@ -47,15 +47,16 @@ const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 /// Subclass slot used by the Visual-hosting code path. Distinct from
-/// `PARENT_SUBCLASS_ID` so the two procs can coexist if a host installs
-/// both kinds of WebView on the same parent HWND.
+/// `PARENT_SUBCLASS_ID` so the Win32 dispatcher routes messages correctly.
+/// NOTE: the current teardown removes both procs together — running two
+/// WebView kinds on the same parent HWND is not supported.
 const PARENT_COMPOSITION_SUBCLASS_ID: u32 = WM_USER + 0x67;
 const PARENT_COMPOSITION_DESTROY_MESSAGE: u32 = WM_USER + 0x68;
-/// Sent by `set_bounds_inner` to push an updated bounds RECT into the
-/// composition-path subclass state. lparam carries a `*mut RECT` (heap-
-/// allocated, transferred ownership; the subclass proc frees it via
-/// `Box::from_raw`).  This keeps the hit-testing rect in sync when the
-/// embedder resizes the WebView without a `WM_SIZE` on the parent.
+/// Sent by `set_bounds_inner` to push an updated bounds into the
+/// composition-path subclass state. Width is packed into `wparam` and height
+/// into `lparam` (the RECT always has left=0, top=0 in this code path).
+/// This keeps the hit-testing rect in sync when the embedder resizes the
+/// WebView without a `WM_SIZE` on the parent.
 const PARENT_COMPOSITION_BOUNDS_CHANGED_MESSAGE: u32 = WM_USER + 0x69;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
@@ -100,7 +101,6 @@ pub(crate) struct InnerWebView {
   /// Set when the WebView was created via the Visual-hosting code path.
   /// Kept alive for the WebView's lifetime; the composition controller
   /// aliases `controller` (same underlying COM object via `cast`).
-  #[allow(dead_code)]
   composition: Option<ICoreWebView2CompositionController>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
@@ -1550,6 +1550,15 @@ impl InnerWebView {
         let _ = state.controller.NotifyParentWindowPositionChanged();
       }
 
+      WM_CAPTURECHANGED => {
+        // Capture is revoked asynchronously (Alt-Tab, another window grabs capture) — clear has_capture so the hit-test path stops forwarding outside-bounds events.
+        let gaining_hwnd = HWND(lparam.0 as _);
+        if gaining_hwnd.0 as isize == 0 || gaining_hwnd != hwnd {
+          *state.has_capture.borrow_mut() = false;
+        }
+        return LRESULT(0);
+      }
+
       WM_MOUSEMOVE
       | WM_LBUTTONDOWN
       | WM_LBUTTONUP
@@ -1583,12 +1592,17 @@ impl InnerWebView {
 
       PARENT_COMPOSITION_BOUNDS_CHANGED_MESSAGE => {
         // Sent by `set_bounds_inner` when the embedder resizes the WebView
-        // without triggering a `WM_SIZE` on the parent. `lparam` carries a
-        // heap-allocated `RECT` whose ownership is transferred here.
-        if lparam.0 != 0 {
-          let new_rect = *Box::from_raw(lparam.0 as *mut RECT);
-          *state.bounds.borrow_mut() = new_rect;
-        }
+        // without triggering a `WM_SIZE` on the parent. Width is packed into
+        // wparam and height into lparam (the RECT always has left=0, top=0).
+        let width = wparam.0 as i32;
+        let height = lparam.0 as i32;
+        let new_rect = RECT {
+          left: 0,
+          top: 0,
+          right: width,
+          bottom: height,
+        };
+        *state.bounds.borrow_mut() = new_rect;
         return LRESULT(0);
       }
 
@@ -1945,16 +1959,16 @@ impl InnerWebView {
       // Keep the composition-path subclass hit-testing rect in sync.
       // `WM_SIZE` on the parent handles resizes triggered by the host window,
       // but an embedder-driven `set_bounds` call can change the controller
-      // bounds without a matching `WM_SIZE`. Send the new rect as a heap
-      // pointer so the subclass can update `state.bounds`.
+      // bounds without a matching `WM_SIZE`. The RECT always has left=0,top=0
+      // in this code path so we pack width into wparam and height into lparam
+      // to avoid a heap allocation and any leak risk on the early-return path.
       if self.composition.is_some() {
         let parent = *self.parent.borrow();
-        let rect_ptr = Box::into_raw(Box::new(new_rect));
         SendMessageW(
           parent,
           PARENT_COMPOSITION_BOUNDS_CHANGED_MESSAGE,
-          Some(WPARAM(0)),
-          Some(LPARAM(rect_ptr as isize)),
+          Some(WPARAM(new_rect.right as usize)),
+          Some(LPARAM(new_rect.bottom as isize)),
         );
       }
 
