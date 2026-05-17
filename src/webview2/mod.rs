@@ -164,6 +164,27 @@ impl InnerWebView {
 
     let hwnd = Self::create_container_hwnd(parent, &attributes, is_child)?;
 
+    // In Visual hosting the container HWND is purely a WebView2 host-reference;
+    // rendering goes to the IDCompositionVisual. `create_container_hwnd` sized
+    // it to the parent's full client area (so the Windowed path has a visible
+    // host immediately), but in Composition mode that coverage steals mouse
+    // messages from the parent's subclass and routes WM_SETCURSOR through the
+    // container's null hCursor. Shrink it to 0×0 right away so the parent
+    // owns the client area.
+    if pl_attrs.dcomp_visual_target.is_some() && !is_child {
+      unsafe {
+        SetWindowPos(
+          hwnd,
+          None,
+          0,
+          0,
+          0,
+          0,
+          SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+        )?;
+      }
+    }
+
     let drop_handler = attributes.drag_drop_handler.take();
     let bounds = attributes.bounds;
 
